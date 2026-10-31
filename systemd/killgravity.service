@@ -1,0 +1,16 @@
+[Unit]
+Description=killgravity - Antigravity Runaway Dump Guard & Process Watchdog (User Service)
+Documentation=https://github.com/Amazing-Stardom/killgravity
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/killgravity daemon
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+

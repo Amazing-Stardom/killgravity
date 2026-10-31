@@ -1,0 +1,757 @@
+#!/usr/bin/env python3
+"""
+killgravity - Antigravity Runaway Dump Guard & Process Watchdog
+Prevents disk exhaustion & irreversible NVMe SSD TBW burn caused by
+Antigravity IDE crash dump loops.
+
+Copyright (c) 2026 Ganesh Kumar.
+Licensed under the MIT License.
+"""
+
+import os
+import sys
+import time
+import signal
+import subprocess
+import argparse
+import glob
+import re
+import shutil
+import json
+from pathlib import Path
+
+VERSION = "1.0.0"
+
+# ==============================================================================
+# Default Configuration
+# ==============================================================================
+DEFAULTS = {
+    "TARGET_PATTERN": "antigravity-ide",
+    "WRITE_THRESHOLD_SECTORS": 1000000,
+    "POLL_INTERVAL": 2,
+    "COOLDOWN_SECONDS": 60,
+    "RESTART_DELAY": 5,
+    "AUTO_RESTART": True,
+    "RESTART_BIN": "",
+    "RESTART_FLAGS": "--disable-crash-reporter",
+    "CLEANUP_DUMPS": True,
+}
+
+# ==============================================================================
+# Terminal Color Formatting
+# ==============================================================================
+IS_TTY = sys.stdout.isatty()
+
+def colorize(text, color_code):
+    if not IS_TTY:
+        return text
+    return f"\033[{color_code}m{text}\033[0m"
+
+RED = "0;31"
+GREEN = "0;32"
+YELLOW = "0;33"
+BLUE = "0;34"
+CYAN = "0;36"
+BOLD = "1"
+
+def log_info(msg):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{colorize('[INFO]', BLUE)} {ts} - {msg}")
+
+def log_warn(msg):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{colorize('[WARN]', YELLOW)} {ts} - {msg}", file=sys.stderr)
+
+def log_alert(msg):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{colorize('[ALERT]', RED)} {ts} - {msg}", file=sys.stderr)
+
+def log_success(msg):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{colorize('[OK]', GREEN)} {ts} - {msg}")
+
+# ==============================================================================
+# Configuration Management
+# ==============================================================================
+class Config:
+    def __init__(self, explicit_path=None):
+        self.explicit_path = explicit_path
+        self.path = None
+        self.data = dict(DEFAULTS)
+        self.load()
+
+    def find_config_file(self):
+        if self.explicit_path and os.path.isfile(self.explicit_path):
+            return self.explicit_path
+        
+        env_path = os.environ.get("KILLGRAVITY_CONFIG")
+        if env_path and os.path.isfile(env_path):
+            return env_path
+
+        candidates = [
+            os.path.expanduser("~/.config/killgravity/killgravity.conf"),
+            "/etc/killgravity/killgravity.conf"
+        ]
+        for c in candidates:
+            if os.path.isfile(c) and os.access(c, os.R_OK):
+                return c
+        return None
+
+    def default_save_path(self):
+        if os.geteuid() == 0:
+            return "/etc/killgravity/killgravity.conf"
+        return os.path.expanduser("~/.config/killgravity/killgravity.conf")
+
+    def load(self):
+        self.path = self.find_config_file()
+        if not self.path:
+            return
+
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip('"').strip("'")
+                        if k in self.data:
+                            # Convert types
+                            if isinstance(DEFAULTS[k], bool):
+                                self.data[k] = v.lower() in ("true", "1", "yes", "on")
+                            elif isinstance(DEFAULTS[k], int):
+                                try:
+                                    self.data[k] = int(v)
+                                except ValueError:
+                                    pass
+                            else:
+                                self.data[k] = v
+        except Exception as e:
+            log_warn(f"Failed to read config from {self.path}: {e}")
+
+    def set_value(self, key, value):
+        if key not in DEFAULTS:
+            log_warn(f"Unknown configuration key: '{key}'")
+            return False
+
+        # Type conversion and validation matching DEFAULTS schema
+        default_val = DEFAULTS[key]
+        converted_value = value
+        if isinstance(default_val, bool):
+            if isinstance(value, str):
+                converted_value = value.lower() in ("true", "1", "yes", "on")
+            else:
+                converted_value = bool(value)
+        elif isinstance(default_val, int):
+            try:
+                converted_value = int(value)
+            except (ValueError, TypeError):
+                log_warn(f"Invalid integer value for {key}: '{value}'")
+                return False
+        elif isinstance(default_val, str):
+            converted_value = str(value).strip('"').strip("'")
+
+        self.data[key] = converted_value
+        save_path = self.path or self.default_save_path()
+        Path(os.path.dirname(save_path)).mkdir(parents=True, exist_ok=True)
+
+        lines = []
+        key_found = False
+        if os.path.isfile(save_path):
+            with open(save_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if not stripped.startswith("#") and "=" in stripped:
+                        k, _ = stripped.split("=", 1)
+                        if k.strip() == key:
+                            val_str = f'"{converted_value}"' if isinstance(converted_value, str) else str(converted_value)
+                            lines.append(f"{key}={val_str}\n")
+                            key_found = True
+                            continue
+                    lines.append(line)
+
+        if not key_found:
+            val_str = f'"{converted_value}"' if isinstance(converted_value, str) else str(converted_value)
+            lines.append(f"{key}={val_str}\n")
+
+        with open(save_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+
+        self.path = save_path
+        print(colorize(f"✓ Updated {key}={converted_value} in {save_path}", GREEN))
+        ServiceManager.restart_if_running()
+        return True
+
+# ==============================================================================
+# Systemd Service Manager
+# ==============================================================================
+class ServiceManager:
+    @staticmethod
+    def detect_scope():
+        if shutil.which("systemctl"):
+            # Check user scope first
+            try:
+                res = subprocess.run(["systemctl", "--user", "is-active", "killgravity.service"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if res.returncode == 0:
+                    return "user"
+                user_unit = os.path.expanduser("~/.config/systemd/user/killgravity.service")
+                if os.path.isfile(user_unit):
+                    return "user"
+            except Exception:
+                pass
+
+            # Check system scope
+            try:
+                res = subprocess.run(["systemctl", "is-active", "killgravity.service"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if res.returncode == 0:
+                    return "system"
+                if os.path.isfile("/etc/systemd/system/killgravity.service"):
+                    return "system"
+            except Exception:
+                pass
+
+        return "system" if os.geteuid() == 0 else "user"
+
+    @classmethod
+    def call(cls, action):
+        scope = cls.detect_scope()
+        if not shutil.which("systemctl"):
+            log_warn("systemctl is not available on this system.")
+            return False
+
+        cmd = ["systemctl"]
+        if scope == "user":
+            cmd.append("--user")
+        cmd.extend([action, "killgravity.service"])
+
+        if scope == "system" and os.geteuid() != 0 and action not in ("status", "is-active", "is-enabled"):
+            print(colorize(f"Notice: System service action '{action}' requires sudo.", YELLOW))
+            cmd = ["sudo"] + cmd
+
+        res = subprocess.run(cmd)
+        return res.returncode == 0
+
+    @classmethod
+    def is_active(cls):
+        scope = cls.detect_scope()
+        cmd = ["systemctl"]
+        if scope == "user":
+            cmd.append("--user")
+        cmd.extend(["is-active", "--quiet", "killgravity.service"])
+        try:
+            return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        except Exception:
+            return False
+
+    @classmethod
+    def is_enabled(cls):
+        scope = cls.detect_scope()
+        cmd = ["systemctl"]
+        if scope == "user":
+            cmd.append("--user")
+        cmd.extend(["is-enabled", "killgravity.service"])
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            return res.stdout.strip() == "enabled"
+        except Exception:
+            return False
+
+    @classmethod
+    def restart_if_running(cls):
+        if cls.is_active():
+            print(colorize("-> Restarting service to apply changes...", BLUE))
+            cls.call("restart")
+
+# ==============================================================================
+# Watchdog Core Engine
+# ==============================================================================
+class Watchdog:
+    def __init__(self, config):
+        self.cfg = config
+        self.running = True
+
+    @staticmethod
+    def get_write_sectors():
+        """Reads field 10 (sectors written) across all storage devices in /proc/diskstats."""
+        if not os.path.isfile("/proc/diskstats"):
+            return 0
+        try:
+            total_sectors = 0
+            with open("/proc/diskstats", "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 10:
+                        total_sectors += int(parts[9])
+            return total_sectors
+        except Exception:
+            return 0
+
+    @staticmethod
+    def find_target_pids(pattern):
+        """Finds PIDs matching target pattern, excluding current process and parent."""
+        my_pid = os.getpid()
+        ppid = os.getppid()
+        pids = []
+
+        try:
+            out = subprocess.check_output(["pgrep", "-f", pattern], text=True)
+            for line in out.splitlines():
+                line = line.strip()
+                if line.isdigit():
+                    pid = int(line)
+                    if pid != my_pid and pid != ppid:
+                        pids.append(pid)
+        except subprocess.CalledProcessError:
+            pass
+        except Exception:
+            pass
+
+        return pids
+
+    @staticmethod
+    def find_ide_binary(explicit_bin=None):
+        """Auto-detects Antigravity IDE binary across explicit config, PATH, and /opt."""
+        if explicit_bin and os.path.isfile(explicit_bin) and os.access(explicit_bin, os.X_OK):
+            return explicit_bin
+
+        # Check standard PATH
+        for name in ("antigravity-ide", "antigravity"):
+            path = shutil.which(name)
+            if path and os.access(path, os.X_OK):
+                return path
+
+        # Search /opt for versioned or unversioned paths (e.g. /opt/antigravity-ide-2.6.0/antigravity-ide)
+        opt_matches = sorted(
+            glob.glob("/opt/antigravity-ide*/antigravity-ide") +
+            glob.glob("/opt/antigravity*/antigravity"),
+            reverse=True
+        )
+        for path in opt_matches:
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return path
+
+        # Check common local dirs
+        home = os.path.expanduser("~")
+        for loc in [
+            f"{home}/.local/bin/antigravity-ide",
+            f"{home}/bin/antigravity-ide",
+            "/usr/local/bin/antigravity-ide"
+        ]:
+            if os.path.isfile(loc) and os.access(loc, os.X_OK):
+                return loc
+
+        return None
+
+    @staticmethod
+    def cleanup_dumps():
+        """Removes crashpad and core dumps created in the last 15 minutes."""
+        home = os.path.expanduser("~")
+        dump_dirs = [
+            f"{home}/.config/Antigravity/Crashpad/pending",
+            f"{home}/.config/Antigravity IDE/Crashpad/pending",
+            f"{home}/.config/Antigravity/Crashpad/completed",
+            f"{home}/.config/Antigravity IDE/Crashpad/completed",
+            "/tmp",
+            "/var/lib/systemd/coredump"
+        ]
+
+        cleaned_count = 0
+        now = time.time()
+        for d in dump_dirs:
+            if not os.path.isdir(d) or not os.access(d, os.W_OK):
+                continue
+            for pattern in ("*.dmp", "core.*", "*antigravity*core*"):
+                for fpath in glob.glob(os.path.join(d, pattern)):
+                    try:
+                        # Only clean files modified within last 15 minutes
+                        if now - os.path.getmtime(fpath) < 900:
+                            os.remove(fpath)
+                            cleaned_count += 1
+                    except Exception:
+                        pass
+        return cleaned_count
+
+    def kill_and_recover(self, pids, speed):
+        log_alert(f"Disk write surge detected ({speed} sectors/s, threshold: {self.cfg.data['WRITE_THRESHOLD_SECTORS']}).")
+        log_alert(f"Terminating runaway '{self.cfg.data['TARGET_PATTERN']}' processes (PIDs: {pids})...")
+
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except Exception as e:
+                log_warn(f"Failed to kill PID {pid}: {e}")
+
+        log_success("Processes terminated.")
+
+        if self.cfg.data["CLEANUP_DUMPS"]:
+            cnt = self.cleanup_dumps()
+            if cnt > 0:
+                log_info(f"Purged {cnt} leftover crashpad dump artifacts.")
+
+        if self.cfg.data["AUTO_RESTART"]:
+            delay = self.cfg.data["RESTART_DELAY"]
+            log_info(f"Waiting {delay}s before restarting IDE...")
+            time.sleep(delay)
+
+            bin_path = self.find_ide_binary(self.cfg.data["RESTART_BIN"])
+            if bin_path:
+                flags = self.cfg.data["RESTART_FLAGS"].split()
+                log_info(f"Relaunching IDE: {bin_path} {' '.join(flags)}")
+                try:
+                    subprocess.Popen(
+                        [bin_path] + flags,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True
+                    )
+                    log_success("Relaunched IDE successfully.")
+                except Exception as e:
+                    log_warn(f"Failed to relaunch IDE: {e}")
+            else:
+                log_warn("Could not auto-detect IDE binary to restart. Set RESTART_BIN in config.")
+
+            cooldown = self.cfg.data["COOLDOWN_SECONDS"]
+            log_info(f"Entering cooldown period of {cooldown}s...")
+            time.sleep(cooldown)
+
+    def run_daemon(self):
+        def sig_handler(signum, frame):
+            log_info("Received termination signal. Exiting daemon...")
+            self.running = False
+
+        signal.signal(signal.SIGINT, sig_handler)
+        signal.signal(signal.SIGTERM, sig_handler)
+
+        interval = self.cfg.data["POLL_INTERVAL"]
+        thresh = self.cfg.data["WRITE_THRESHOLD_SECTORS"]
+        target = self.cfg.data["TARGET_PATTERN"]
+
+        log_info(f"Starting killgravity daemon v{VERSION} (Python engine)...")
+        log_info(f"Target pattern: '{target}' | Threshold: {thresh} sectors/s (~{thresh // 2048} MB/s)")
+        log_info(f"Poll interval: {interval}s | Auto-restart: {self.cfg.data['AUTO_RESTART']}")
+        if self.cfg.path:
+            log_info(f"Active configuration: {self.cfg.path}")
+
+        while self.running:
+            pids = self.find_target_pids(target)
+            if pids:
+                w1 = self.get_write_sectors()
+                time.sleep(interval)
+                w2 = self.get_write_sectors()
+
+                delta = max(0, w2 - w1)
+                speed = delta // interval
+
+                if speed > thresh:
+                    # Double-check PIDs before pulling trigger
+                    pids = self.find_target_pids(target)
+                    if pids:
+                        self.kill_and_recover(pids, speed)
+            else:
+                time.sleep(interval)
+
+# ==============================================================================
+# CLI Commands
+# ==============================================================================
+def cmd_status(cfg):
+    scope = ServiceManager.detect_scope()
+    is_active = ServiceManager.is_active()
+    is_enabled = ServiceManager.is_enabled()
+
+    print(colorize(f"killgravity Status (v{VERSION} Python Engine)", BOLD))
+    print("=" * 50)
+
+    act_str = colorize("RUNNING", GREEN) if is_active else colorize("STOPPED", YELLOW)
+    enb_str = colorize("ENABLED", GREEN) if is_enabled else colorize("DISABLED", YELLOW)
+    print(f"Service Status:    {act_str} ({scope} service)")
+    print(f"Service Enabled:   {enb_str} (starts on boot/login)")
+
+    cfg_str = colorize(cfg.path, GREEN) if cfg.path else colorize("None (using defaults)", YELLOW)
+    print(f"Config File:       {cfg_str}")
+    print("-" * 50)
+
+    print(f"Target Pattern:    {colorize(cfg.data['TARGET_PATTERN'], CYAN)}")
+    thresh = cfg.data['WRITE_THRESHOLD_SECTORS']
+    print(f"Threshold:         {colorize(str(thresh), CYAN)} sectors/s (~{thresh // 2048} MB/s)")
+    print(f"Poll Interval:     {colorize(str(cfg.data['POLL_INTERVAL']) + 's', CYAN)}")
+    print(f"Cooldown:          {colorize(str(cfg.data['COOLDOWN_SECONDS']) + 's', CYAN)}")
+    print(f"Auto-Restart:      {colorize(str(cfg.data['AUTO_RESTART']).lower(), CYAN)}")
+
+    bin_path = Watchdog.find_ide_binary(cfg.data["RESTART_BIN"])
+    bin_str = colorize(bin_path, GREEN) if bin_path else colorize("Not found (set RESTART_BIN)", YELLOW)
+    print(f"IDE Binary:        {bin_str}")
+    print("-" * 50)
+
+    pids = Watchdog.find_target_pids(cfg.data["TARGET_PATTERN"])
+    if pids:
+        print(f"Target Process:    {colorize('ACTIVE', GREEN)} ({len(pids)} processes detected)")
+    else:
+        print(f"Target Process:    {colorize('INACTIVE', YELLOW)} (no matching processes)")
+
+    s1 = Watchdog.get_write_sectors()
+    time.sleep(1)
+    s2 = Watchdog.get_write_sectors()
+    rate = max(0, s2 - s1)
+    rate_mb = rate // 2048
+    print(f"Current Disk Write: {rate} sectors/s (~{rate_mb} MB/s)")
+    print("=" * 50)
+
+def cmd_threshold(cfg, value=None):
+    if not value:
+        thresh = cfg.data['WRITE_THRESHOLD_SECTORS']
+        print(f"Current write threshold: {colorize(str(thresh), CYAN)} sectors/s (~{thresh // 2048} MB/s)")
+        print("To change: killgravity threshold <sectors|number[M|MB|G|GB]>")
+        return
+
+    m = re.match(r"^([0-9]+)\s*([mM][bB]?|[gG][bB]?)$", value)
+    if m:
+        num = int(m.group(1))
+        unit = m.group(2).upper()
+        if "G" in unit:
+            sectors = num * 1024 * 2048
+        else:
+            sectors = num * 2048
+    elif value.isdigit():
+        num = int(value)
+        if num < 10000:
+            print(colorize(f"Interpreting {num} as {num} MB ({num * 2048} sectors/s)...", BLUE))
+            sectors = num * 2048
+        else:
+            sectors = num
+    else:
+        log_warn(f"Invalid threshold format: {value}. Examples: 500M, 1G, 1000000")
+        return
+
+    cfg.set_value("WRITE_THRESHOLD_SECTORS", sectors)
+
+def cmd_time(cfg, setting=None, seconds=None):
+    if not setting:
+        print("Current timing settings:")
+        print(f"  Poll interval:    {colorize(str(cfg.data['POLL_INTERVAL']), CYAN)} seconds")
+        print(f"  Cooldown time:    {colorize(str(cfg.data['COOLDOWN_SECONDS']), CYAN)} seconds")
+        print(f"  Restart delay:    {colorize(str(cfg.data['RESTART_DELAY']), CYAN)} seconds")
+        print("\nTo change:")
+        print("  killgravity time interval <seconds>")
+        print("  killgravity time cooldown <seconds>")
+        print("  killgravity time delay <seconds>")
+        return
+
+    key_map = {
+        "interval": "POLL_INTERVAL",
+        "poll": "POLL_INTERVAL",
+        "cooldown": "COOLDOWN_SECONDS",
+        "delay": "RESTART_DELAY",
+    }
+    if setting in key_map:
+        if seconds is not None:
+            cfg.set_value(key_map[setting], int(seconds))
+        else:
+            print(f"{setting}: {cfg.data[key_map[setting]]} seconds")
+    elif setting.isdigit():
+        cfg.set_value("POLL_INTERVAL", int(setting))
+    else:
+        log_warn(f"Unknown timing parameter: {setting}")
+
+def cmd_target(cfg, pattern=None):
+    if not pattern:
+        print(f"Current target pattern: {colorize(cfg.data['TARGET_PATTERN'], CYAN)}")
+        print("To change: killgravity target <pattern>")
+        return
+    cfg.set_value("TARGET_PATTERN", pattern)
+
+def cmd_auto_restart(cfg, state=None):
+    if not state:
+        val = str(cfg.data['AUTO_RESTART']).lower()
+        print(f"Auto-restart is currently: {colorize(val, CYAN)}")
+        print("To change: killgravity auto-restart on|off")
+        return
+    enable = state.lower() in ("on", "true", "1", "enable", "yes")
+    cfg.set_value("AUTO_RESTART", enable)
+
+def cmd_kill(cfg):
+    target = cfg.data["TARGET_PATTERN"]
+    log_info(f"Searching for active '{target}' processes...")
+    pids = Watchdog.find_target_pids(target)
+    if not pids:
+        log_info(f"No matching processes found for pattern '{target}'.")
+        return
+
+    log_alert(f"Terminating target PIDs: {pids}...")
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+    log_success("Processes terminated.")
+
+    if cfg.data["CLEANUP_DUMPS"]:
+        Watchdog.cleanup_dumps()
+
+def cmd_clean():
+    log_info("Purging stale crashpad and core dump files...")
+    count = Watchdog.cleanup_dumps()
+    log_success(f"Cleaned up {count} dump files.")
+
+def cmd_test(cfg):
+    print(colorize("Running diagnostic probe...", BOLD))
+    s1 = Watchdog.get_write_sectors()
+    print(f"1. /proc/diskstats read check: initial count = {s1}")
+    print("2. Measuring write speed over 2 seconds...")
+    time.sleep(2)
+    s2 = Watchdog.get_write_sectors()
+    delta = max(0, s2 - s1)
+    rate = delta // 2
+    print(f"   Rate: {rate} sectors/s (~{rate // 2048} MB/s)")
+
+    pids = Watchdog.find_target_pids(cfg.data["TARGET_PATTERN"])
+    if pids:
+        print(f"3. Target detection ('{cfg.data['TARGET_PATTERN']}'): {colorize(f'FOUND PIDs {pids}', GREEN)}")
+    else:
+        print(f"3. Target detection ('{cfg.data['TARGET_PATTERN']}'): {colorize('No matching targets running', YELLOW)}")
+
+    bin_path = Watchdog.find_ide_binary(cfg.data["RESTART_BIN"])
+    if bin_path:
+        print(f"4. IDE Binary discovery: {colorize(bin_path, GREEN)}")
+    else:
+        print(f"4. IDE Binary discovery: {colorize('Not found automatically', YELLOW)}")
+
+    print(colorize("✓ Diagnostic complete.", GREEN))
+
+# ==============================================================================
+# Main Parser & Dispatcher
+# ==============================================================================
+def main():
+    parser = argparse.ArgumentParser(
+        prog="killgravity",
+        description=f"killgravity v{VERSION} - Antigravity Dump Guard & SSD TBW Watchdog",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Service Management:
+  status                     Display live daemon, service, and NVMe I/O status
+  enable                     Enable service to start on boot/login
+  disable                    Disable service from auto-starting
+  start                      Start the watchdog service
+  stop                       Stop the watchdog service
+  restart                    Restart the watchdog service
+  logs [-f]                  View service journal logs
+
+Configuration:
+  threshold [VALUE]          View or set write speed trigger (e.g. 500M, 1G, 1000000)
+  time [subcommand] [val]    View or set timings (interval, cooldown, delay)
+  target [PATTERN]           View or set target process regex pattern
+  auto-restart [on|off]      Enable or disable auto-restarting the IDE
+  config                     Display effective configuration
+
+Operations:
+  daemon | run               Run watchdog loop in foreground
+  kill                       Manually terminate active target processes
+  clean                      Purge leftover crashpad (.dmp) and core dumps
+  test                       Run diagnostic probe on diskstats and process matching
+  mcp                        Run MCP JSON-RPC stdio server for Antigravity
+        """
+    )
+    parser.add_argument("-v", "--version", action="version", version=f"killgravity version {VERSION}")
+    parser.add_argument("--config", dest="config_path", help="Path to custom config file")
+    parser.add_argument("--pattern", dest="pattern", help="Override TARGET_PATTERN")
+    parser.add_argument("command", nargs="?", default="status", help="Command to run")
+    parser.add_argument("args", nargs=argparse.REMAINDER, help="Arguments for command")
+
+    parsed = parser.parse_args()
+    cfg = Config(explicit_path=parsed.config_path)
+    if parsed.pattern:
+        cfg.data["TARGET_PATTERN"] = parsed.pattern
+
+    cmd = parsed.command.lower()
+    cargs = parsed.args
+
+    if cmd in ("version", "--version"):
+        print(f"killgravity version {VERSION}")
+        sys.exit(0)
+    elif cmd in ("help", "--help"):
+        parser.print_help()
+        sys.exit(0)
+
+    if cmd in ("daemon", "run"):
+        wd = Watchdog(cfg)
+        wd.run_daemon()
+    elif cmd == "status":
+        cmd_status(cfg)
+    elif cmd == "enable":
+        print(colorize("-> Enabling killgravity service...", BLUE))
+        ServiceManager.call("enable")
+        log_success("killgravity service enabled.")
+    elif cmd == "disable":
+        print(colorize("-> Disabling killgravity service...", BLUE))
+        ServiceManager.call("disable")
+        log_success("killgravity service disabled.")
+    elif cmd == "start":
+        print(colorize("-> Starting killgravity service...", BLUE))
+        ServiceManager.call("start")
+        log_success("killgravity service started.")
+    elif cmd == "stop":
+        print(colorize("-> Stopping killgravity service...", BLUE))
+        ServiceManager.call("stop")
+        log_success("killgravity service stopped.")
+    elif cmd == "restart":
+        print(colorize("-> Restarting killgravity service...", BLUE))
+        ServiceManager.call("restart")
+        log_success("killgravity service restarted.")
+    elif cmd == "logs":
+        scope = ServiceManager.detect_scope()
+        jcmd = ["journalctl", "--user" if scope == "user" else "", "-u", "killgravity.service"] + cargs
+        jcmd = [x for x in jcmd if x]
+        try:
+            subprocess.run(jcmd)
+        except KeyboardInterrupt:
+            pass
+    elif cmd == "threshold":
+        cmd_threshold(cfg, cargs[0] if cargs else None)
+    elif cmd == "time":
+        sub = cargs[0] if len(cargs) > 0 else None
+        sec = cargs[1] if len(cargs) > 1 else None
+        cmd_time(cfg, sub, sec)
+    elif cmd in ("interval", "poll"):
+        cmd_time(cfg, "interval", cargs[0] if cargs else None)
+    elif cmd == "cooldown":
+        cmd_time(cfg, "cooldown", cargs[0] if cargs else None)
+    elif cmd == "target":
+        cmd_target(cfg, cargs[0] if cargs else None)
+    elif cmd in ("auto-restart", "autorestart"):
+        cmd_auto_restart(cfg, cargs[0] if cargs else None)
+    elif cmd == "kill":
+        cmd_kill(cfg)
+    elif cmd == "clean":
+        cmd_clean()
+    elif cmd == "test":
+        cmd_test(cfg)
+    elif cmd == "config":
+        if not cargs:
+            print(colorize(f"Configuration file: {cfg.path or 'None (defaults)'}", BOLD))
+            for k, v in cfg.data.items():
+                print(f"{k}={v}")
+        elif cargs[0] == "path":
+            print(cfg.path or cfg.default_save_path())
+        elif cargs[0] == "set" and len(cargs) >= 3:
+            cfg.set_value(cargs[1], cargs[2])
+    elif cmd == "mcp":
+        # Launch MCP server logic
+        from pathlib import Path
+        mcp_script = Path(__file__).resolve().parent.parent / "mcp" / "server.py"
+        if mcp_script.is_file():
+            os.execv(sys.executable, [sys.executable, str(mcp_script)] + cargs)
+        else:
+            log_warn(f"MCP server script not found at {mcp_script}")
+    else:
+        log_warn(f"Unknown command: {cmd}")
+        parser.print_help()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

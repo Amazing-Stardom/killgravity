@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check script syntax
+        run: make check
+
+      - name: Run test suite
+        run: make test
+
+      - name: Test rootless installation
+        run: |
+          set -euo pipefail
+          ./install.sh --user
+          export PATH="$HOME/.local/bin:$PATH"
+          killgravity --version
+          killgravity status
+          killgravity test
+          ./install.sh uninstall --purge
+

@@ -1,0 +1,66 @@
+{
+  "name": "killgravity",
+  "displayName": "killgravity",
+  "description": "Live disk write monitor & SSD TBW guard for Antigravity IDE",
+  "version": "1.1.0",
+  "publisher": "hexmos",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "killgravity.status",
+        "title": "killgravity: Status & Controls",
+        "icon": "$(shield)"
+      },
+      {
+        "command": "killgravity.start",
+        "title": "killgravity: Start Guard Service"
+      },
+      {
+        "command": "killgravity.stop",
+        "title": "killgravity: Stop Guard Service"
+      },
+      {
+        "command": "killgravity.clean",
+        "title": "killgravity: Clean Core & Crash Dumps"
+      },
+      {
+        "command": "killgravity.emergencyKill",
+        "title": "killgravity: Emergency Kill Runaway Processes"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "killgravity.status",
+          "group": "navigation@1"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "killgravity",
+      "properties": {
+        "killgravity.executablePath": {
+          "type": "string",
+          "default": "",
+          "description": "Custom path to killgravity executable (leave blank for auto-detection in PATH, ~/.local/bin, or /usr/local/bin)"
+        },
+        "killgravity.pollIntervalSeconds": {
+          "type": "number",
+          "default": 2,
+          "description": "Polling interval in seconds for sampling disk write speed via main script"
+        }
+      }
+    }
+  }
+}
+

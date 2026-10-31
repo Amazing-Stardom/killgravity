@@ -20,6 +20,7 @@ uninstall-purge:
 check:
 	python3 -m py_compile bin/killgravity mcp/server.py
 	bash -n install.sh tests/test_detection.sh scripts/release.sh scripts/audit.sh
+	node -c ide-extension/extension.js
 
 test:
 	./tests/test_detection.sh

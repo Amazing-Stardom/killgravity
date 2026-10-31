@@ -167,6 +167,14 @@ for py in "${PY_FILES[@]}"; do
     fi
 done
 
+if [ -f "${ROOT_DIR}/ide-extension/extension.js" ]; then
+    if node -c "${ROOT_DIR}/ide-extension/extension.js"; then
+        report_pass "JavaScript syntax valid: ide-extension/extension.js"
+    else
+        report_fail "JavaScript syntax error in: ide-extension/extension.js"
+    fi
+fi
+
 # 5. Process & Kill Safety Bounds Audit
 echo -e "\n${BLUE}5. Process Safety & Blast Radius Audit:${NC}"
 # Ensure kill commands do not use unrestricted / bare pkill

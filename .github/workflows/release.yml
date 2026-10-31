@@ -14,10 +14,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
       - name: Run verification
         run: |
           make check
           make test
+          make audit
 
       - name: Package release archive
         run: |
@@ -27,11 +33,22 @@ jobs:
           sha256sum "$ARCHIVE_NAME" > "${ARCHIVE_NAME}.sha256"
           echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> $GITHUB_ENV
 
+      - name: Package Antigravity IDE Extension (.vsix)
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          VSIX_NAME="killgravity-${TAG_NAME}.vsix"
+          cd ide-extension
+          npx --yes @vscode/vsce package --allow-missing-repository -o "../${VSIX_NAME}"
+          cd ..
+          sha256sum "$VSIX_NAME" > "${VSIX_NAME}.sha256"
+          echo "VSIX_NAME=$VSIX_NAME" >> $GITHUB_ENV
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             ${{ env.ARCHIVE_NAME }}
             ${{ env.ARCHIVE_NAME }}.sha256
+            ${{ env.VSIX_NAME }}
+            ${{ env.VSIX_NAME }}.sha256
           generate_release_notes: true
-

@@ -9,4 +9,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Releases
 
+- **[v1.1.0](docs/changelog/v1.1.0.md)** (2026-11-01) - Antigravity IDE status monitor extension, `--json` machine-readable output, fast atomic tmpfs caching, and automated `.vsix` release packaging.
 - **[v1.0.0](docs/changelog/v1.0.0.md)** (2026-11-01) - Initial public open-source release. Complete CLI manager, systemd services, TBW endurance protection, and zero-dependency installer.

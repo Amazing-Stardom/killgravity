@@ -197,12 +197,31 @@ do_install() {
         # Register MCP in Antigravity
         register_mcp_config "${bin_dir}/killgravity-mcp"
 
+        # Install Antigravity IDE extension if IDE exists
+        local ext_installed=false
+        local ext_ver="1.0.0"
+        if [ -f "${SCRIPT_DIR}/ide-extension/package.json" ]; then
+            ext_ver=$(grep -E '"version"\s*:' "${SCRIPT_DIR}/ide-extension/package.json" | head -n1 | cut -d'"' -f4)
+        fi
+        local ext_dir="${HOME}/.antigravity-ide/extensions/hexmos.killgravity-${ext_ver}-universal"
+        if [ -d "${HOME}/.antigravity-ide/extensions" ] || [ -d "${HOME}/.config/Antigravity IDE" ]; then
+            echo -e "${BLUE}->${NC} Installing Antigravity IDE extension to ${ext_dir}"
+            mkdir -p "$ext_dir"
+            cp "${SCRIPT_DIR}/ide-extension/package.json" "${ext_dir}/"
+            cp "${SCRIPT_DIR}/ide-extension/extension.js" "${ext_dir}/"
+            ext_installed=true
+        fi
+
         echo -e "\n${GREEN}${BOLD}✓ User installation complete!${NC}"
         echo -e "CLI Binary:  ${bin_dir}/killgravity"
         echo -e "MCP Server:  ${bin_dir}/killgravity-mcp"
         echo -e "Config:      ${conf_dir}/killgravity.conf"
         echo -e "Service:     killgravity.service (systemctl --user)"
-        echo -e "Antigravity: MCP tools enabled (killgravity_*)"
+        if [ "$ext_installed" = "true" ]; then
+            echo -e "Antigravity: MCP tools & IDE extension enabled"
+        else
+            echo -e "Antigravity: MCP tools enabled (killgravity_*)"
+        fi
         echo -e "\nVerify with:"
         echo -e "  killgravity status"
 
@@ -278,6 +297,7 @@ do_uninstall() {
         rm -f "${HOME}/.local/bin/killgravity"
         rm -f "${HOME}/.local/bin/killgravity-mcp"
         rm -f "${HOME}/.config/systemd/user/killgravity.service"
+        rm -rf "${HOME}/.antigravity-ide/extensions/hexmos.killgravity-"*
 
         unregister_mcp_config
 

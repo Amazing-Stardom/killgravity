@@ -20,7 +20,8 @@ import shutil
 import json
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+LIVE_STATE_FILE = f"/tmp/killgravity-live-{os.getuid()}.json"
 
 # ==============================================================================
 # Default Configuration
@@ -375,6 +376,66 @@ class Watchdog:
                         pass
         return cleaned_count
 
+    @classmethod
+    def write_live_state(cls, speed, pids, thresh):
+        """Atomically persists runtime state for fast sampling by IDE extensions and CLI tools."""
+        state = {
+            "timestamp": time.time(),
+            "write_sectors_per_sec": speed,
+            "write_mb_per_sec": round(speed / 2048, 2),
+            "target_count": len(pids),
+            "target_pids": pids,
+            "threshold_sectors": thresh,
+            "threshold_mb": round(thresh / 2048, 2),
+            "surge_detected": speed >= thresh,
+            "service_active": True
+        }
+        try:
+            tmp_path = f"{LIVE_STATE_FILE}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(state, f)
+            os.replace(tmp_path, LIVE_STATE_FILE)
+        except Exception:
+            pass
+
+    @classmethod
+    def get_live_state(cls, cfg, fast=True):
+        """Returns live metrics, reading fresh daemon cache if active or sampling directly."""
+        try:
+            if os.path.isfile(LIVE_STATE_FILE):
+                mtime = os.path.getmtime(LIVE_STATE_FILE)
+                if time.time() - mtime < 4.0:
+                    with open(LIVE_STATE_FILE, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        data["cached_from_daemon"] = True
+                        return data
+        except Exception:
+            pass
+
+        sample_time = 0.25 if fast else 1.0
+        s1 = cls.get_write_sectors()
+        time.sleep(sample_time)
+        s2 = cls.get_write_sectors()
+        delta = max(0, s2 - s1)
+        speed = int(delta / sample_time)
+        thresh = cfg.data["WRITE_THRESHOLD_SECTORS"]
+        pids = cls.find_target_pids(cfg.data["TARGET_PATTERN"])
+
+        is_active = ServiceManager.is_active()
+
+        return {
+            "timestamp": time.time(),
+            "write_sectors_per_sec": speed,
+            "write_mb_per_sec": round(speed / 2048, 2),
+            "target_count": len(pids),
+            "target_pids": pids,
+            "threshold_sectors": thresh,
+            "threshold_mb": round(thresh / 2048, 2),
+            "surge_detected": speed >= thresh,
+            "service_active": is_active,
+            "cached_from_daemon": False
+        }
+
     def kill_and_recover(self, pids, speed):
         log_alert(f"Disk write surge detected ({speed} sectors/s, threshold: {self.cfg.data['WRITE_THRESHOLD_SECTORS']}).")
         log_alert(f"Terminating runaway '{self.cfg.data['TARGET_PATTERN']}' processes (PIDs: {pids})...")
@@ -424,6 +485,11 @@ class Watchdog:
         def sig_handler(signum, frame):
             log_info("Received termination signal. Exiting daemon...")
             self.running = False
+            try:
+                if os.path.isfile(LIVE_STATE_FILE):
+                    os.remove(LIVE_STATE_FILE)
+            except Exception:
+                pass
 
         signal.signal(signal.SIGINT, sig_handler)
         signal.signal(signal.SIGTERM, sig_handler)
@@ -447,6 +513,7 @@ class Watchdog:
 
                 delta = max(0, w2 - w1)
                 speed = delta // interval
+                self.write_live_state(speed, pids, thresh)
 
                 if speed > thresh:
                     # Double-check PIDs before pulling trigger
@@ -454,15 +521,60 @@ class Watchdog:
                     if pids:
                         self.kill_and_recover(pids, speed)
             else:
+                self.write_live_state(0, [], thresh)
                 time.sleep(interval)
 
 # ==============================================================================
 # CLI Commands
 # ==============================================================================
-def cmd_status(cfg):
+def cmd_status(cfg, as_json=False):
     scope = ServiceManager.detect_scope()
     is_active = ServiceManager.is_active()
     is_enabled = ServiceManager.is_enabled()
+    thresh = cfg.data['WRITE_THRESHOLD_SECTORS']
+    bin_path = Watchdog.find_ide_binary(cfg.data["RESTART_BIN"])
+    pids = Watchdog.find_target_pids(cfg.data["TARGET_PATTERN"])
+
+    live = Watchdog.get_live_state(cfg, fast=True)
+    rate = live["write_sectors_per_sec"]
+    rate_mb = live["write_mb_per_sec"]
+
+    if as_json:
+        data = {
+            "version": VERSION,
+            "service": {
+                "status": "RUNNING" if is_active else "STOPPED",
+                "active": is_active,
+                "enabled": is_enabled,
+                "scope": scope
+            },
+            "config": {
+                "path": cfg.path,
+                "target_pattern": cfg.data['TARGET_PATTERN'],
+                "threshold_sectors": thresh,
+                "threshold_mb": round(thresh / 2048, 2),
+                "poll_interval": cfg.data['POLL_INTERVAL'],
+                "cooldown_seconds": cfg.data['COOLDOWN_SECONDS'],
+                "auto_restart": cfg.data['AUTO_RESTART'],
+                "ide_binary": bin_path
+            },
+            "target": {
+                "pattern": cfg.data['TARGET_PATTERN'],
+                "active": bool(pids),
+                "count": len(pids),
+                "pids": pids
+            },
+            "io": {
+                "write_sectors_per_sec": rate,
+                "write_mb_per_sec": rate_mb,
+                "threshold_sectors_per_sec": thresh,
+                "threshold_mb_per_sec": round(thresh / 2048, 2),
+                "headroom_pct": max(0.0, round((1.0 - (rate / thresh if thresh else 0)) * 100, 2)),
+                "surge_detected": rate >= thresh
+            }
+        }
+        print(json.dumps(data, indent=2))
+        return
 
     print(colorize(f"killgravity Status (v{VERSION} Python Engine)", BOLD))
     print("=" * 50)
@@ -477,30 +589,32 @@ def cmd_status(cfg):
     print("-" * 50)
 
     print(f"Target Pattern:    {colorize(cfg.data['TARGET_PATTERN'], CYAN)}")
-    thresh = cfg.data['WRITE_THRESHOLD_SECTORS']
     print(f"Threshold:         {colorize(str(thresh), CYAN)} sectors/s (~{thresh // 2048} MB/s)")
     print(f"Poll Interval:     {colorize(str(cfg.data['POLL_INTERVAL']) + 's', CYAN)}")
     print(f"Cooldown:          {colorize(str(cfg.data['COOLDOWN_SECONDS']) + 's', CYAN)}")
     print(f"Auto-Restart:      {colorize(str(cfg.data['AUTO_RESTART']).lower(), CYAN)}")
 
-    bin_path = Watchdog.find_ide_binary(cfg.data["RESTART_BIN"])
     bin_str = colorize(bin_path, GREEN) if bin_path else colorize("Not found (set RESTART_BIN)", YELLOW)
     print(f"IDE Binary:        {bin_str}")
     print("-" * 50)
 
-    pids = Watchdog.find_target_pids(cfg.data["TARGET_PATTERN"])
     if pids:
         print(f"Target Process:    {colorize('ACTIVE', GREEN)} ({len(pids)} processes detected)")
     else:
         print(f"Target Process:    {colorize('INACTIVE', YELLOW)} (no matching processes)")
 
-    s1 = Watchdog.get_write_sectors()
-    time.sleep(1)
-    s2 = Watchdog.get_write_sectors()
-    rate = max(0, s2 - s1)
-    rate_mb = rate // 2048
     print(f"Current Disk Write: {rate} sectors/s (~{rate_mb} MB/s)")
     print("=" * 50)
+
+def cmd_sample(cfg, as_json=False):
+    state = Watchdog.get_live_state(cfg, fast=True)
+    if as_json:
+        print(json.dumps(state, indent=2))
+    else:
+        status_str = colorize("ACTIVE", GREEN) if state["service_active"] else colorize("STOPPED", YELLOW)
+        cached_str = " (daemon live feed)" if state.get("cached_from_daemon") else ""
+        print(f"Service: {status_str}{cached_str} | Target PIDs: {state['target_count']}")
+        print(f"Write Speed: {state['write_sectors_per_sec']} sectors/s (~{state['write_mb_per_sec']} MB/s)")
 
 def cmd_threshold(cfg, value=None):
     if not value:
@@ -577,17 +691,28 @@ def cmd_auto_restart(cfg, state=None):
 def cmd_kill(cfg):
     target = cfg.data["TARGET_PATTERN"]
     log_info(f"Searching for active '{target}' processes...")
+
+    try:
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    except Exception:
+        pass
+
     pids = Watchdog.find_target_pids(target)
     if not pids:
         log_info(f"No matching processes found for pattern '{target}'.")
         return
 
     log_alert(f"Terminating target PIDs: {pids}...")
+    my_pid = os.getpid()
+    ppid = os.getppid()
+
     for pid in pids:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except Exception:
-            pass
+        if pid not in (my_pid, ppid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
 
     log_success("Processes terminated.")
 
@@ -634,6 +759,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Service Management:
+  sample                     Fast 250ms I/O sampling (or instant from daemon)
   status                     Display live daemon, service, and NVMe I/O status
   enable                     Enable service to start on boot/login
   disable                    Disable service from auto-starting
@@ -658,6 +784,7 @@ Operations:
         """
     )
     parser.add_argument("-v", "--version", action="version", version=f"killgravity version {VERSION}")
+    parser.add_argument("-j", "--json", dest="as_json", action="store_true", help="Output machine-readable JSON")
     parser.add_argument("--config", dest="config_path", help="Path to custom config file")
     parser.add_argument("--pattern", dest="pattern", help="Override TARGET_PATTERN")
     parser.add_argument("command", nargs="?", default="status", help="Command to run")
@@ -671,6 +798,9 @@ Operations:
     cmd = parsed.command.lower()
     cargs = parsed.args
 
+    is_json = parsed.as_json or "--json" in cargs or "-j" in cargs
+    cargs = [a for a in cargs if a not in ("--json", "-j")]
+
     if cmd in ("version", "--version"):
         print(f"killgravity version {VERSION}")
         sys.exit(0)
@@ -681,8 +811,10 @@ Operations:
     if cmd in ("daemon", "run"):
         wd = Watchdog(cfg)
         wd.run_daemon()
+    elif cmd == "sample":
+        cmd_sample(cfg, as_json=is_json)
     elif cmd == "status":
-        cmd_status(cfg)
+        cmd_status(cfg, as_json=is_json)
     elif cmd == "enable":
         print(colorize("-> Enabling killgravity service...", BLUE))
         ServiceManager.call("enable")

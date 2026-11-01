@@ -95,6 +95,7 @@ async function updateStatus() {
   }
 
   const speedMb = data.write_mb_per_sec || 0;
+  const targetMb = data.target_write_mb_per_sec || 0;
   const sectors = data.write_sectors_per_sec || 0;
   const threshMb = data.threshold_mb || 488;
   const isActive = data.service_active;
@@ -106,12 +107,12 @@ async function updateStatus() {
     statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
   } else if (speedMb > 150) {
     statusBarItem.text = `$(alert) ${speedMb} MB/s`;
-    statusBarItem.tooltip = `Elevated Disk Writes: ${speedMb} MB/s (${sectors} sectors/s)\nThreshold: ${threshMb} MB/s\nGuard: ${isActive ? 'RUNNING' : 'STOPPED'}\nClick for options.`;
+    statusBarItem.tooltip = `Elevated Disk Writes: System ${speedMb} MB/s | Target IDE ${targetMb} MB/s (Terminal build active)\nThreshold: ${threshMb} MB/s\nGuard: ${isActive ? 'RUNNING' : 'STOPPED'}\nClick for options.`;
     statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
   } else {
     const icon = isActive ? '$(shield)' : '$(database)';
     statusBarItem.text = `${icon} ${speedMb} MB/s`;
-    statusBarItem.tooltip = `killgravity Disk Guard\nStatus: ${isActive ? 'ACTIVE (Protected)' : 'STOPPED'}\nWrite Rate: ${speedMb} MB/s (${sectors} sectors/s)\nLimit: ${threshMb} MB/s\nActive PIDs: ${pids}\nClick for controls.`;
+    statusBarItem.tooltip = `killgravity Disk Guard\nStatus: ${isActive ? 'ACTIVE (Protected)' : 'STOPPED'}\nSystem I/O: ${speedMb} MB/s (${sectors} sectors/s)\nTarget IDE I/O: ${targetMb} MB/s\nLimit: ${threshMb} MB/s\nActive PIDs: ${pids} (Terminal shells excluded)\nClick for controls.`;
     statusBarItem.backgroundColor = undefined;
   }
 

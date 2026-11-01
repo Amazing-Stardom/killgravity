@@ -40,10 +40,10 @@ echo -n "Testing: Dummy process termination ... "
 bash -c 'exec -a "mock-antigravity-ide-test" sleep 30' &
 MOCK_PID=$!
 
-# Wait for process to start
+# Wait for process to start and exec to mock name
 STARTED=false
 for _ in {1..30}; do
-    if kill -0 "$MOCK_PID" 2>/dev/null; then
+    if grep -q "mock-antigravity-ide-test" "/proc/$MOCK_PID/cmdline" 2>/dev/null && [ "$(basename "$(readlink -f "/proc/$MOCK_PID/exe" 2>/dev/null || true)")" != "bash" ]; then
         STARTED=true
         break
     fi

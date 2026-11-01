@@ -13,7 +13,7 @@ import json
 import os
 import subprocess
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # Locate killgravity binary
 def get_killgravity_cmd():

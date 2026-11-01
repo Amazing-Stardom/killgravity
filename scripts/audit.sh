@@ -154,18 +154,19 @@ else
     report_fail "Config file format invalid: config/killgravity.conf"
 fi
 
-PY_FILES=(
-    "bin/killgravity"
-    "mcp/server.py"
-)
-
-for py in "${PY_FILES[@]}"; do
-    if python3 -m py_compile "${ROOT_DIR}/${py}" 2>/dev/null; then
-        report_pass "Python syntax valid: ${py}"
+if [ -f "${ROOT_DIR}/go.mod" ]; then
+    if (cd "$ROOT_DIR" && go vet ./... 2>/dev/null); then
+        report_pass "Go syntax and vet valid: ${ROOT_DIR}"
     else
-        report_fail "Python syntax error in: ${py}"
+        report_fail "Go vet failed on project sources"
     fi
-done
+fi
+
+if python3 -m py_compile "${ROOT_DIR}/mcp/server.py" 2>/dev/null; then
+    report_pass "Python syntax valid: mcp/server.py"
+else
+    report_fail "Python syntax error in: mcp/server.py"
+fi
 
 if [ -f "${ROOT_DIR}/ide-extension/extension.js" ]; then
     if node -c "${ROOT_DIR}/ide-extension/extension.js"; then
@@ -178,13 +179,13 @@ fi
 # 5. Process & Kill Safety Bounds Audit
 echo -e "\n${BLUE}5. Process Safety & Blast Radius Audit:${NC}"
 # Ensure kill commands do not use unrestricted / bare pkill
-if grep -q "pkill -9 -if \"antigravity\"" "${ROOT_DIR}/bin/killgravity"; then
+if grep -q "pkill -9 -if \"antigravity\"" "${ROOT_DIR}"/*.go 2>/dev/null; then
     report_fail "Dangerous broad match found: 'pkill -9 -if antigravity' (could kill agent/hub)"
 else
     report_pass "Process killing safely scoped to '${BIN_VER}' / targeted pattern"
 fi
 
-if grep -q "pid != my_pid" "${ROOT_DIR}/bin/killgravity"; then
+if grep -q "pid != my_pid" "${ROOT_DIR}"/*.go 2>/dev/null; then
     report_pass "Process filtering excludes self (my_pid) and parent (ppid)"
 else
     report_warn "Double check process filtering exclusions"

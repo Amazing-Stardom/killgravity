@@ -55,60 +55,78 @@ if ! git diff-index --quiet HEAD -- 2>/dev/null; then
     fi
 fi
 
-# 1. Update version in bin/killgravity and mcp/server.py
-echo -e "${BLUE}->${NC} Updating version in bin/killgravity and mcp/server.py..."
+TODAY=$(date '+%Y-%m-%d')
+VERSION_DOC="${ROOT_DIR}/docs/changelog/v${NEW_VERSION}.md"
+
+# 1. Update version across all project components & changelogs in a single unified step
+echo -e "${BLUE}->${NC} Updating version to v${NEW_VERSION} across codebase and changelogs..."
 python3 -c '
-import sys, re
-for path in sys.argv[2:]:
-    with open(path, "r", encoding="utf-8") as f:
+import sys, os, re, json
+
+ver = sys.argv[1]
+root = sys.argv[2]
+today = sys.argv[3]
+
+# 1. Update Go version in version.go
+go_ver_path = f"{root}/version.go"
+if os.path.isfile(go_ver_path):
+    with open(go_ver_path, "r", encoding="utf-8") as f:
         text = f.read()
-    text = re.sub(r"VERSION\s*=\s*\"[^\"]+\"", f"VERSION = \"{sys.argv[1]}\"", text)
-    with open(path, "w", encoding="utf-8") as f:
+    text = re.sub(r"const Version = \"[^\"]+\"", f"const Version = \"{ver}\"", text)
+    with open(go_ver_path, "w", encoding="utf-8") as f:
         f.write(text)
-' "${NEW_VERSION}" "${ROOT_DIR}/bin/killgravity" "${ROOT_DIR}/mcp/server.py"
+
+# 2. Update MCP VERSION in mcp/server.py
+mcp_path = f"{root}/mcp/server.py"
+if os.path.isfile(mcp_path):
+    with open(mcp_path, "r", encoding="utf-8") as f:
+        text = f.read()
+    text = re.sub(r"VERSION\s*=\s*\"[^\"]+\"", f"VERSION = \"{ver}\"", text)
+    with open(mcp_path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+# 3. Update version in ide-extension/package.json
+pkg_path = f"{root}/ide-extension/package.json"
+if os.path.isfile(pkg_path):
+    with open(pkg_path, "r", encoding="utf-8") as f:
+        pkg = json.load(f)
+    pkg["version"] = ver
+    with open(pkg_path, "w", encoding="utf-8") as f:
+        json.dump(pkg, f, indent=2)
+        f.write("\n")
+
+# 4. Create version-specific doc under docs/changelog/vX.Y.Z.md if not exists
+doc_dir = f"{root}/docs/changelog"
+os.makedirs(doc_dir, exist_ok=True)
+doc_path = f"{doc_dir}/v{ver}.md"
+if not os.path.isfile(doc_path):
+    with open(doc_path, "w", encoding="utf-8") as f:
+        f.write(f"# Release v{ver} ({today})\n\n## Changes in this release\n- Antigravity Dump Guard & SSD TBW Watchdog release v{ver}.\n")
+
+# 5. Update main CHANGELOG.md index
+cl_path = f"{root}/CHANGELOG.md"
+if os.path.isfile(cl_path):
+    with open(cl_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    entry = f"- **[v{ver}](docs/changelog/v{ver}.md)** ({today}) - Release v{ver}."
+    if f"v{ver}" not in content:
+        lines = content.splitlines(keepends=True)
+        new_lines = []
+        for line in lines:
+            new_lines.append(line)
+            if line.strip() == "## Releases":
+                new_lines.append(f"{entry}\n")
+        with open(cl_path, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+' "${NEW_VERSION}" "${ROOT_DIR}" "${TODAY}"
 
 # 2. Run checks, tests, and security audit
 echo -e "${BLUE}->${NC} Running verification tests & pre-release security audit..."
 (cd "$ROOT_DIR" && make check && make test && make audit)
 
-# 3. Create version-specific doc under docs/changelog/
-CHANGELOG_DIR="${ROOT_DIR}/docs/changelog"
-mkdir -p "$CHANGELOG_DIR"
-VERSION_DOC="${CHANGELOG_DIR}/v${NEW_VERSION}.md"
-TODAY=$(date '+%Y-%m-%d')
-
-if [ ! -f "$VERSION_DOC" ]; then
-    echo -e "${BLUE}->${NC} Generating ${VERSION_DOC}..."
-    cat <<EOF > "$VERSION_DOC"
-# Release v${NEW_VERSION} (${TODAY})
-
-## Changes in this release
-- Maintenance release and updates.
-EOF
-fi
-
-# 4. Update main CHANGELOG.md index
-if ! grep -q "v${NEW_VERSION}" "${ROOT_DIR}/CHANGELOG.md"; then
-    echo -e "${BLUE}->${NC} Adding v${NEW_VERSION} to CHANGELOG.md..."
-    python3 -c '
-import sys
-path = sys.argv[1]
-entry = sys.argv[2]
-with open(path, "r", encoding="utf-8") as f:
-    lines = f.readlines()
-new_lines = []
-for line in lines:
-    new_lines.append(line)
-    if line.strip() == "## Releases":
-        new_lines.append(f"- {entry}\n")
-with open(path, "w", encoding="utf-8") as f:
-    f.writelines(new_lines)
-' "${ROOT_DIR}/CHANGELOG.md" "**[v${NEW_VERSION}](docs/changelog/v${NEW_VERSION}.md)** (${TODAY}) - Release v${NEW_VERSION}."
-fi
-
 # 5. Git commit and tag
 echo -e "${BLUE}->${NC} Staging files..."
-git add "${ROOT_DIR}/bin/killgravity" "${ROOT_DIR}/CHANGELOG.md" "${VERSION_DOC}"
+git add -A "${ROOT_DIR}"
 
 if git diff --staged --quiet; then
     echo -e "${YELLOW}No changes to commit (already up-to-date).${NC}"

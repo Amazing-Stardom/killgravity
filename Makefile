@@ -1,14 +1,17 @@
-.PHONY: all install install-user install-system uninstall uninstall-purge test check audit release
+.PHONY: all build check test audit install install-user install-system uninstall uninstall-purge release
 
-all: check test audit
+all: build check test audit
 
-install:
+build:
+	go build -o bin/killgravity .
+
+install: build
 	./install.sh
 
-install-user:
+install-user: build
 	./install.sh --user
 
-install-system:
+install-system: build
 	sudo ./install.sh --system
 
 uninstall:
@@ -17,15 +20,16 @@ uninstall:
 uninstall-purge:
 	./install.sh uninstall --purge
 
-check:
-	python3 -m py_compile bin/killgravity mcp/server.py
+check: build
+	go vet ./...
+	python3 -m py_compile mcp/server.py
 	bash -n install.sh tests/test_detection.sh scripts/release.sh scripts/audit.sh
 	node -c ide-extension/extension.js
 
-test:
+test: build
 	./tests/test_detection.sh
 
-audit:
+audit: build
 	./scripts/audit.sh
 
 release:
